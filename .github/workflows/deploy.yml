@@ -1,0 +1,37 @@
+name: Secure Deployment
+
+on: [push]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Decrypt environment
+      run: |
+        python -c "
+        from cryptography.fernet import Fernet
+        cipher = Fernet(b'${{ env.ENCRYPTION_KEY }}')
+        with open('meme_tracker/config/.env.enc', 'rb') as f:
+          with open('meme_tracker/config/.env', 'wb') as out:
+            out.write(cipher.decrypt(f.read()))
+        "
+
+    - name: Security audit
+      run: python meme_tracker/tools/security_audit.py
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install cryptography
+
+    # 添加您的部署步骤...

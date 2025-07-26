@@ -1,0 +1,48 @@
+name: Full API Test with Notification
+on: [workflow_dispatch]
+
+jobs:
+  api-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install pytest requests python-telegram-bot
+          
+      - name: Run API tests
+        env:
+          REDDIT_API_KEY: ${{ secrets.REDDIT_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # 执行所有API测试
+          pytest test_reddit_api.py final_validation.py -v > test_results.txt
+          
+          # 发送测试结果到Telegram
+          python -c "
+          import os, requests
+          try:
+              with open('test_results.txt') as f:
+                  text = f.read()
+              resp = requests.post(
+                  f'https://api.telegram.org/bot{os.getenv(\"TELEGRAM_TOKEN\")}/sendMessage',
+                  json={'chat_id': os.getenv('TELEGRAM_CHAT_ID'), 
+                        'text': f'✅ API测试完成：\n{text[:1000]}'}
+              )
+              print(f'Telegram通知状态: {resp.status_code}')
+          except Exception as e:
+              print(f'⚠️ 通知发送失败: {str(e)}')
+          "
+          
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-test-results
+          path: test_results.txt

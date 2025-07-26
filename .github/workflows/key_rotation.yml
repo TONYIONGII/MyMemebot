@@ -1,0 +1,49 @@
+name: Quarterly Key Rotation
+on:
+  schedule:
+    - cron: "0 0 1 */3 *"  # 每季度首日午夜运行
+  workflow_dispatch:        # 允许手动触发
+
+jobs:
+  rotate-keys:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install Vault CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y vault
+          
+      - name: Rotate API Keys
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          # 1. 生成新密钥
+          NEW_KEY=$(vault kv get -field=value secret/api_keys/new)
+          
+          # 2. 更新系统配置
+          vault kv put secret/api_keys/current value=$NEW_KEY
+          
+          # 3. 归档旧密钥
+          vault kv put secret/api_keys/old value=$(vault kv get -field=value secret/api_keys/current)
+          
+          # 4. 验证服务连接
+          python tools/test_reddit_api.py --key=$NEW_KEY
+          
+      - name: Notify team
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '🔑 季度密钥轮换已完成，新密钥已部署到生产环境'
+            })
