@@ -241,16 +241,32 @@ jobs:
       uses: actions/github-script@v6
       with:
         script: |
-          const fs = require('fs');
-          
-          // 仅发送GitHub通知
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功 ✅' : '失败 ❌'}\n` +
-                  `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
-          });
+          try {
+            // 更健壮的通知逻辑
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const message = `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功 ✅' : '失败 ❌'}\n详情: ${runUrl}`;
+            
+            // 尝试创建issue评论（仅在有issue时）
+            if (context.issue.number) {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: message
+              });
+            }
+            
+            // 总是创建部署状态commit评论
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: message
+            });
+          } catch (error) {
+            console.error('通知发送失败:', error.message);
+            // 静默失败，不影响主流程
+          }
           
           try {
             // 读取安全报告
