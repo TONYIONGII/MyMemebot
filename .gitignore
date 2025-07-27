@@ -2,6 +2,9 @@
 venv/
 meme_tracker/venv/
 
+# 环境变量文件
+.env
+
 # 环境文件
 .env
 meme_tracker/config/.env

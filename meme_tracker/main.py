@@ -89,10 +89,27 @@ async def stress_test():
     return True
 
 def daemonize():
-    """创建守护进程"""
+    """创建安全的守护进程"""
     import os
     import sys
+    import tempfile
     from signal import SIGTERM
+    from pathlib import Path
+    
+    # 创建临时目录
+    temp_dir = Path(tempfile.mkdtemp(prefix='meme-tracker-'))
+    log_file = temp_dir / 'meme-tracker.log'
+    err_file = temp_dir / 'meme-tracker.err'
+    
+    def cleanup():
+        """清理资源"""
+        try:
+            if temp_dir.exists():
+                for f in temp_dir.glob('*'):
+                    f.unlink()
+                temp_dir.rmdir()
+        except Exception as e:
+            sys.stderr.write(f"清理临时文件失败: {e}\n")
     
     try:
         pid = os.fork()
@@ -100,11 +117,12 @@ def daemonize():
             sys.exit(0)
     except OSError as e:
         sys.stderr.write(f"第一次fork失败: {e}\n")
+        cleanup()
         sys.exit(1)
         
     os.chdir("/")
     os.setsid()
-    os.umask(0)
+    os.umask(0o077)  # 更安全的权限
     
     try:
         pid = os.fork()
@@ -112,6 +130,7 @@ def daemonize():
             sys.exit(0)
     except OSError as e:
         sys.stderr.write(f"第二次fork失败: {e}\n")
+        cleanup()
         sys.exit(1)
         
     sys.stdout.flush()
@@ -120,10 +139,14 @@ def daemonize():
     # 重定向标准文件描述符
     with open('/dev/null', 'r') as f:
         os.dup2(f.fileno(), sys.stdin.fileno())
-    with open('/tmp/meme-tracker.out', 'a+') as f:
+    with open(log_file, 'a+') as f:
         os.dup2(f.fileno(), sys.stdout.fileno())
-    with open('/tmp/meme-tracker.err', 'a+') as f:
+    with open(err_file, 'a+') as f:
         os.dup2(f.fileno(), sys.stderr.fileno())
+    
+    # 注册清理函数
+    import atexit
+    atexit.register(cleanup)
 
 def main():
     """主程序入口"""
@@ -131,9 +154,27 @@ def main():
         daemonize()
     
     logger.info("跳过Telegram通知功能，仅运行核心逻辑")
-    while True:
-        asyncio.run(check_and_notify())
+    
+    # 添加优雅退出处理
+    import signal
+    shutdown = False
+    
+    def handle_signal(signum, frame):
+        nonlocal shutdown
+        logger.info(f"收到信号 {signum}, 准备优雅退出...")
+        shutdown = True
+    
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    
+    while not shutdown:
+        try:
+            asyncio.run(check_and_notify())
+        except Exception as e:
+            logger.error(f"主循环出错: {e}")
         time.sleep(1800)  # 每30分钟运行一次
+    
+    logger.info("程序优雅退出")
 
 if __name__ == "__main__":
     main()

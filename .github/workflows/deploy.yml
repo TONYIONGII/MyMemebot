@@ -12,41 +12,148 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
-
-    - name: Check for .env.enc
+        python-version: '3.11'
+        cache: 'pip'
+    - name: Install dependencies
       run: |
+        echo "正在安装依赖..."
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Validate and encrypt environment
+      run: |
+        # 检查requirements.txt是否存在
+        if [ ! -f "requirements.txt" ]; then
+          echo "::error::关键文件缺失: requirements.txt不存在"
+          exit 1
+        fi
+        
+        # 如果.env.enc不存在但.env存在，则加密生成.env.enc
         if [ ! -f "meme_tracker/config/.env.enc" ]; then
-          echo "::warning::加密文件meme_tracker/config/.env.enc不存在，将使用默认配置"
-          touch meme_tracker/config/.env
-          echo "REDDIT_CLIENT_ID=default" >> meme_tracker/config/.env
-          echo "REDDIT_CLIENT_SECRET=default" >> meme_tracker/config/.env
+          if [ -f "meme_tracker/config/.env" ]; then
+            echo "生成加密环境文件..."
+            python meme_tracker/tools/encrypt_env.py --key "${{ secrets.ENCRYPTION_KEY }}" \
+              --input "meme_tracker/config/.env" \
+              --output "meme_tracker/config/.env.enc"
+          else
+            echo "::warning::未找到环境文件，请确保已设置ENCRYPTION_KEY并创建.env文件"
+          fi
         fi
 
     - name: Decrypt environment
+      if: success() || failure()  # 即使前面步骤失败也尝试解密
+      run: |
+        if [ -f "meme_tracker/config/.env.enc" ]; then
+          python -c "
+          import os
+          import sys
+          from cryptography.fernet import Fernet
+          from cryptography.fernet import InvalidToken
+          
+          try:
+            if not os.path.exists('meme_tracker/config'):
+              os.makedirs('meme_tracker/config')
+              
+            cipher = Fernet(b'${{ secrets.ENCRYPTION_KEY }}')
+            with open('meme_tracker/config/.env.enc', 'rb') as f:
+              encrypted = f.read()
+              try:
+                decrypted = cipher.decrypt(encrypted)
+                with open('meme_tracker/config/.env', 'wb') as out:
+                  out.write(decrypted)
+                print('解密成功')
+              except InvalidToken:
+                print('::error::解密失败: 无效的加密密钥或损坏的文件')
+                sys.exit(1)
+          except Exception as e:
+            print(f'::error::解密过程中发生错误: {e}')
+            sys.exit(1)
+          "
+        else
+          echo "::warning::未找到加密环境文件，跳过解密步骤"
+        fi
+        
+        echo "验证关键依赖版本..."
+        python -c "
+        import importlib.metadata as metadata
+        required = {
+            'praw': '7.8.1',
+            'cryptography': '45.0.5',
+            'pytest': '8.4.1',
+            'python-dotenv': '1.0.1'
+        }
+        for pkg, expected in required.items():
+            try:
+                ver = metadata.version(pkg)
+                assert ver == expected, f'{pkg}版本不匹配: 需要{expected}但安装了{ver}'
+                print(f'✓ {pkg}=={ver}')
+            except Exception as e:
+                print(f'::error::{e}')
+                exit(1)
+        "
+        
+        echo "运行安全扫描..."
+        bandit -r meme_tracker -ll
+        
+        echo "清理缓存..."
+        pip cache purge
+    - name: Verify environment
       run: |
         python -c "
+        import os
         import sys
-        from cryptography.fernet import Fernet
-        try:
-          cipher = Fernet(b'${{ env.ENCRYPTION_KEY }}')
-          with open('meme_tracker/config/.env.enc', 'rb') as f:
-            with open('meme_tracker/config/.env', 'wb') as out:
-              out.write(cipher.decrypt(f.read()))
-        except Exception as e:
-          print(f'::error::解密失败: {e}')
+        from dotenv import load_dotenv
+        
+        print('验证环境配置...')
+        if not os.path.exists('meme_tracker/config/.env'):
+          print('::error::环境文件未正确生成')
           sys.exit(1)
+          
+        load_dotenv('meme_tracker/config/.env')
+        required_vars = ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'REDDIT_USER_AGENT']
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        
+        if missing_vars:
+          print(f'::error::缺少必要的环境变量: {missing_vars}')
+          sys.exit(1)
+          
+        print('环境验证通过')
         "
 
-    - name: Security audit
+    - name: Container Security Scan
+      if: github.event_name == 'push'
       run: |
-        python meme_tracker/tools/security_audit.py || echo "::warning::安全审计发现问题但继续执行"
+        echo "=== 安装Trivy容器扫描工具 ==="
+        sudo apt-get update
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install -y trivy
+        
+        echo "=== 扫描Docker镜像 ==="
+        trivy image --security-checks vuln,config --severity CRITICAL,HIGH --exit-code 1 \
+          --format template --template "@contrib/html.tpl" -o trivy_report.html \
+          your-registry/meme_tracker:${{ github.sha }}
+          
+        echo "=== 验证镜像签名 ==="
+        docker trust inspect --pretty your-registry/meme_tracker:${{ github.sha }}
 
-    - name: Install dependencies
+    - name: Post-deployment verification
       run: |
-        pip install -r requirements.txt
-        pip install cryptography
-
-    # 添加您的部署步骤...
+        echo "执行部署后验证..."
+        curl -sSf http://localhost:8000/healthcheck || echo "::error::服务健康检查失败"
+        
+    - name: Notify on failure
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: '部署失败，请检查工作流运行日志: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          })

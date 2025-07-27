@@ -25,17 +25,31 @@ jobs:
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: |
-          # 1. 生成新密钥
+          # 1. 检查密钥是否过期
+          KEY_AGE=$(vault kv get -field=age secret/api_keys/current)
+          if [ $KEY_AGE -lt 90 ]; then
+            echo "密钥未达到90天最小使用期限，跳过轮换"
+            exit 0
+          fi
+          
+          # 2. 审计密钥使用情况
+          vault read -format=json sys/audit | jq -r '.data.paths' > audit_logs.json
+          python tools/analyze_key_usage.py audit_logs.json
+          
+          # 3. 生成新密钥
           NEW_KEY=$(vault kv get -field=value secret/api_keys/new)
           
-          # 2. 更新系统配置
-          vault kv put secret/api_keys/current value=$NEW_KEY
+          # 4. 更新系统配置
+          vault kv put secret/api_keys/current value=$NEW_KEY age=0
           
-          # 3. 归档旧密钥
-          vault kv put secret/api_keys/old value=$(vault kv get -field=value secret/api_keys/current)
+          # 5. 归档旧密钥并标记为已撤销
+          vault kv put secret/api_keys/old value=$(vault kv get -field=value secret/api_keys/current) status=revoked
           
-          # 4. 验证服务连接
-          python tools/test_reddit_api.py --key=$NEW_KEY
+          # 6. 验证服务连接
+          python tools/test_reddit_api.py --key=$NEW_KEY || exit 1
+          
+          # 7. 更新所有服务配置
+          python tools/update_services.py --key=$NEW_KEY
           
       - name: Notify team
         uses: actions/github-script@v6

@@ -4,11 +4,32 @@ on:
     - cron: '0 0 1 * *' # 每月1日执行
 jobs:
   audit:
-    runs-on: macOS-latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: |
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Run security check
+        run: |
           cd meme_tracker
-          ./security_check.sh
+          ./security_check.sh || exit 1
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
           git add config/SECURITY.log
           git commit -m "月度安全审计 $(date +%Y-%m-%d)"
+          git push
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⚠️ 安全审计失败，请检查日志！'
+            })
