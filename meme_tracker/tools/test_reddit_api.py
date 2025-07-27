@@ -1,4 +1,5 @@
 import os
+import pytest
 import praw
 from dotenv import load_dotenv
 import json
@@ -17,11 +18,11 @@ def test_reddit_connection():
         
         # 使用基础API测试
         subreddit = reddit.subreddit('all')
-        return "✅ 连接成功 - API响应正常"
+        assert subreddit is not None, "无法获取subreddit信息"
         
     except Exception as e:
-        return f"❌ 连接失败: {str(e)}"
+        pytest.fail(f"Reddit API连接失败: {str(e)}")
 
 if __name__ == "__main__":
-    result = test_reddit_connection()
-    print(json.dumps(result, ensure_ascii=False))
+    test_reddit_connection()
+    print("测试执行完成")

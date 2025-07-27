@@ -24,7 +24,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           # 执行所有API测试
-          pytest test_reddit_api.py final_validation.py -v > test_results.txt
+          pytest meme_tracker/tools/test_reddit_api.py ./final_validation.py -v > test_results.txt
           
           # 发送测试结果到Telegram
           python -c "
