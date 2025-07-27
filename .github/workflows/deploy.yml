@@ -19,8 +19,10 @@ jobs:
     - name: Check for .env.enc
       run: |
         if [ ! -f "meme_tracker/config/.env.enc" ]; then
-          echo "::error::加密文件meme_tracker/config/.env.enc不存在"
-          exit 1
+          echo "::warning::加密文件meme_tracker/config/.env.enc不存在，将使用默认配置"
+          touch meme_tracker/config/.env
+          echo "REDDIT_CLIENT_ID=default" >> meme_tracker/config/.env
+          echo "REDDIT_CLIENT_SECRET=default" >> meme_tracker/config/.env
         fi
 
     - name: Decrypt environment

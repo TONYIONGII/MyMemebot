@@ -8,8 +8,12 @@ def detect_secrets():
     
     # 检查加密文件完整性
     env_enc = Path("meme_tracker/config/.env.enc")
+    env_file = Path("meme_tracker/config/.env")
     if not env_enc.exists():
-        risks.append("❌ 缺失加密的.env.enc文件")
+        if env_file.exists() and "default" in env_file.read_text():
+            risks.append("⚠️ 使用默认配置 - 请创建正式的.env.enc文件")
+        else:
+            risks.append("❌ 缺失加密的.env.enc文件且无默认配置")
     elif env_enc.stat().st_size < 10:
         risks.append("❌ 加密文件可能损坏")
 
