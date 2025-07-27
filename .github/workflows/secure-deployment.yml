@@ -236,18 +236,21 @@ jobs:
           bandit_report.json
           trivy_report.html
 
-    - name: Install Slack dependencies
-      if: always()
-      run: npm install @slack/web-api
-      
-    - name: Notify deployment status
+    - name: Notify deployment status (GitHub only)
       if: always()
       uses: actions/github-script@v6
       with:
         script: |
           const fs = require('fs');
-          const { WebClient } = require('@slack/web-api');
-          const slack = new WebClient(process.env.SLACK_WEBHOOK);
+          
+          // 仅发送GitHub通知
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功 ✅' : '失败 ❌'}\n` +
+                  `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+          });
           
           try {
             // 读取安全报告
