@@ -1,0 +1,5 @@
+# 数据库文件
+meme_tracker/data/*.db
+
+# 日志文件
+meme_tracker/logs/*.log
