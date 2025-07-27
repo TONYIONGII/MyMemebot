@@ -14,7 +14,8 @@ jobs:
           
       - name: Install dependencies
         run: |
-          pip install pytest requests python-telegram-bot
+          pip install -r requirements.txt
+          pip install pytest requests python-telegram-bot cryptography
           
       - name: Run API tests
         env:
