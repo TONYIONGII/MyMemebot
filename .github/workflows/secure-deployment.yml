@@ -245,6 +245,10 @@ jobs:
           bandit_report.json
           trivy_report.html
 
+    - name: Install Slack dependencies
+      if: always()
+      run: npm install @slack/web-api
+      
     - name: Notify deployment status
       if: always()
       uses: actions/github-script@v6
