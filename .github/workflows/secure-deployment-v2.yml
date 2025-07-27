@@ -1,0 +1,47 @@
+name: "Secure Deployment v2"
+on: [push, workflow_dispatch]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        echo "当前目录结构:"
+        ls -R
+        pip install -r requirements.txt --no-cache-dir
+        
+    - name: Pre-deployment Checks
+      run: |
+        echo "::group::环境验证"
+        [ -n "${{ secrets.ENCRYPTION_KEY }}" ] || { echo "::error::缺少加密密钥"; exit 1; }
+        curl --connect-timeout 10 -I https://api.github.com | grep "200 OK" || exit 1
+        echo "::endgroup::"
+
+    - name: Run Security Scan
+      continue-on-error: true
+      run: |
+        bandit -r . -c pyproject.toml -f json -o security-report.json
+        
+    - name: Deploy with Rollback
+      run: |
+        set -e
+        echo "::group::部署日志"
+        ./deploy.sh || {
+          echo "::error::部署失败，执行回滚"
+          ./rollback.sh
+          exit 1
+        }
+        echo "::endgroup::"
