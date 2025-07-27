@@ -1,0 +1,38 @@
+name: Secure Deployment
+
+on: [push]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Validate Environment
+      run: |
+        echo "验证部署环境..."
+        [ -f "requirements.txt" ] || { echo "::error::缺少requirements.txt"; exit 1; }
+        [ -n "$ENCRYPTION_KEY" ] || { echo "::error::未配置ENCRYPTION_KEY"; exit 1; }
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt --no-cache-dir
+
+    - name: Run Security Checks
+      run: |
+        bandit -r . -c pyproject.toml
+        
+    - name: Build and Deploy
+      run: |
+        echo "执行安全部署流程..."
+        # 添加您的部署脚本
