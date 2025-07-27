@@ -1,0 +1,17 @@
+[Unit]
+Description=Meme Coin Tracker Service
+After=network.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=/Users/iohongiong/comate-zulu-demo-1753124168900
+ExecStart=/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv/bin/python /Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/main.py
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=meme-tracker
+
+[Install]
+WantedBy=multi-user.target

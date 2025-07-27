@@ -1,0 +1,55 @@
+2025-07-26 23:54:59,678 - __main__ - INFO - 开始压力测试...
+2025-07-26 23:55:00,245 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot%E4%BD%A0%E7%9A%84%E7%9C%9F%E5%AE%9EBotToken/getMe "HTTP/1.1 404 Not Found"
+Traceback (most recent call last):
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/_bot.py", line 735, in initialize
+    await self.get_me()
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/ext/_extbot.py", line 1697, in get_me
+    return await super().get_me(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/_bot.py", line 525, in decorator
+    result = await func(self, *args, **kwargs)  # skipcq: PYL-E1102
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/_bot.py", line 775, in get_me
+    result = await self._post(
+             ^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/_bot.py", line 613, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/ext/_extbot.py", line 340, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/_bot.py", line 641, in _do_post
+    return await request.post(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/request/_baserequest.py", line 200, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/request/_baserequest.py", line 377, in _request_wrapper
+    raise InvalidToken(message)
+telegram.error.InvalidToken: Not Found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/main.py", line 152, in <module>
+    main()
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/main.py", line 145, in main
+    asyncio.run(stress_test())
+  File "/opt/homebrew/Cellar/python@3.11/3.11.13/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.13/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.13/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/main.py", line 91, in stress_test
+    await notifier.app.initialize()
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/ext/_application.py", line 477, in initialize
+    await self.bot.initialize()
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/ext/_extbot.py", line 286, in initialize
+    await super().initialize()
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/venv-3.11/lib/python3.11/site-packages/telegram/_bot.py", line 737, in initialize
+    raise InvalidToken(f"The token `{self._token}` was rejected by the server.") from exc
+telegram.error.InvalidToken: The token `你的真实BotToken` was rejected by the server.

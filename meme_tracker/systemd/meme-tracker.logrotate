@@ -1,0 +1,13 @@
+/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/logs/meme_tracker.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    create 644 %USER% %USER%
+    sharedscripts
+    postrotate
+        systemctl kill -s HUP meme-tracker.service
+    endscript
+}

@@ -1,0 +1,12 @@
+2025-07-27 00:51:30,446 - asyncio - DEBUG - Using selector: KqueueSelector
+2025-07-27 00:51:30,447 - meme_tracker.social_media - INFO - Reddit API客户端初始化成功
+2025-07-27 00:51:30,447 - meme_tracker.social_media - WARNING - Twitter客户端处于测试模式 - 跳过初始化
+2025-07-27 00:51:30,448 - root - INFO - 1. 测试Reddit认证...
+2025-07-27 00:51:30,842 - meme_tracker.reddit_api - ERROR - Reddit认证失败: 401 - {"message": "Unauthorized", "error": 401}
+2025-07-27 00:51:30,843 - root - CRITICAL - 测试失败: 认证失败: {"message": "Unauthorized", "error": 401}
+Traceback (most recent call last):
+  File "<string>", line 24, in production_test
+  File "/Users/iohongiong/comate-zulu-demo-1753124168900/meme_tracker/reddit_api.py", line 43, in authenticate
+    raise Exception(f"认证失败: {error}")
+Exception: 认证失败: {"message": "Unauthorized", "error": 401}
+2025-07-27 00:51:30,843 - meme_tracker.social_media - INFO - Reddit客户端资源清理完成
