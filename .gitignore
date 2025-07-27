@@ -1,5 +1,16 @@
-# 数据库文件
-meme_tracker/data/*.db
+# 虚拟环境
+venv/
+meme_tracker/venv/
 
-# 日志文件
-meme_tracker/logs/*.log
+# 环境文件
+.env
+meme_tracker/config/.env
+
+# Python缓存
+__pycache__/
+*.py[cod]
+meme_tracker/tools/__pycache__/
+
+# 临时文件
+*.tmp
+check_env.py
