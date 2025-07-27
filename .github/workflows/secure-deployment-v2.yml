@@ -1,47 +1,222 @@
-name: "Secure Deployment v2"
-on: [push, workflow_dispatch]
+name: Advanced Secure Deployment
+on:
+  push:
+    branches:
+      - main
+      - release/*
+    paths:
+      - 'meme_tracker/**'
+      - 'requirements.txt'
+      - '.github/workflows/*'
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_DEPLOY_WEBHOOK }}
+    
     steps:
-    - name: Checkout
+    - name: Checkout with depth 1
       uses: actions/checkout@v4
       with:
         fetch-depth: 1
 
-    - name: Setup Python
+    - name: Setup Python with caching
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
         cache: 'pip'
+        cache-dependency-path: 'requirements.txt'
 
-    - name: Install Dependencies
+    - name: Pre-deployment validation
       run: |
-        echo "当前目录结构:"
-        ls -R
+        echo "::group::部署前验证"
+        # 验证关键文件存在
+        required_files=("requirements.txt" "meme_tracker/config/.env.enc" "deploy.sh" "rollback.sh")
+        for file in "${required_files[@]}"; do
+          if [ ! -f "$file" ] && [ ! -d "$file" ]; then
+            echo "::error::关键文件/目录缺失: $file"
+            exit 1
+          fi
+        done
+        
+        # 验证环境变量配置
+        if [ -z "${{ secrets.ENCRYPTION_KEY }}" ]; then
+          echo "::error::缺少加密密钥"
+          exit 1
+        fi
+        
+        # 验证网络连接
+        if ! curl --retry 3 --connect-timeout 10 -I https://api.github.com | grep "200 OK"; then
+          echo "::error::网络连接验证失败"
+          exit 1
+        fi
+        
+        # 验证部署脚本权限
+        if [ ! -x "deploy.sh" ] || [ ! -x "rollback.sh" ]; then
+          echo "::error::部署脚本缺少执行权限"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Install dependencies with verification
+      run: |
+        echo "::group::依赖安装与验证"
+        pip install --upgrade pip
         pip install -r requirements.txt --no-cache-dir
         
-    - name: Pre-deployment Checks
-      run: |
-        echo "::group::环境验证"
-        [ -n "${{ secrets.ENCRYPTION_KEY }}" ] || { echo "::error::缺少加密密钥"; exit 1; }
-        curl --connect-timeout 10 -I https://api.github.com | grep "200 OK" || exit 1
+        # 验证依赖签名
+        python -m pip install pip-licenses
+        pip-licenses --format=json --output-file=licenses.json
+        python tools/verify_licenses.py licenses.json
         echo "::endgroup::"
 
-    - name: Run Security Scan
-      continue-on-error: true
+    - name: Security scans
       run: |
-        bandit -r . -c pyproject.toml -f json -o security-report.json
+        echo "::group::安全扫描"
+        # 安装安全工具
+        pip install safety==2.4.5 bandit==1.7.5
         
-    - name: Deploy with Rollback
+        # 依赖漏洞扫描
+        safety check --full-report --output safety_report.json || true
+        bandit -r . -f json -o bandit_report.json || true
+        
+        # 分析扫描结果
+        python tools/analyze_security.py \
+          safety_report.json \
+          bandit_report.json || {
+            echo "::error::发现关键安全问题，终止部署"
+            exit 1
+          }
+        echo "::endgroup::"
+
+    - name: Deploy with enhanced rollback
       run: |
+        echo "::group::部署执行"
         set -e
-        echo "::group::部署日志"
-        ./deploy.sh || {
+        
+        # 备份当前版本
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        BACKUP_DIR="backup_$TIMESTAMP"
+        mkdir -p $BACKUP_DIR
+        cp -r meme_tracker $BACKUP_DIR/
+        cp requirements.txt $BACKUP_DIR/
+        
+        # 执行部署
+        if ./deploy.sh; then
+          echo "✅ 部署成功"
+        else
           echo "::error::部署失败，执行回滚"
-          ./rollback.sh
+          
+          # 恢复备份
+          if [ -d "$BACKUP_DIR" ]; then
+            rm -rf meme_tracker
+            cp -r $BACKUP_DIR/meme_tracker .
+            cp $BACKUP_DIR/requirements.txt .
+            
+            # 执行回滚脚本
+            if ./rollback.sh; then
+              echo "✅ 回滚成功"
+            else
+              echo "::error::回滚失败，需要手动干预"
+              exit 1
+            fi
+          else
+            echo "::error::备份目录不存在，无法回滚"
+            exit 1
+          fi
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Post-deployment verification
+      run: |
+        echo "::group::部署后验证"
+        # 健康检查
+        curl --retry 5 --retry-delay 10 --max-time 30 -sSf http://localhost:8000/healthcheck || {
+          echo "::error::服务健康检查失败"
           exit 1
         }
+        
+        # API可用性检查
+        python tools/test_api_connectivity.py || {
+          echo "::error::API连接测试失败"
+          exit 1
+        }
+        
+        # 验证环境变量
+        python -c "
+        import os
+        from dotenv import load_dotenv
+        load_dotenv('meme_tracker/config/.env')
+        required = ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'DATABASE_URL']
+        missing = [var for var in required if not os.getenv(var)]
+        if missing:
+            print(f'::error::部署后环境变量缺失: {missing}')
+            exit(1)
+        "
         echo "::endgroup::"
+
+    - name: Notify deployment status
+      if: always()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const { WebClient } = require('@slack/web-api');
+          const slack = new WebClient(process.env.SLACK_WEBHOOK);
+          
+          try {
+            // 读取安全报告
+            const safetyReport = fs.existsSync('safety_report.json') ? 
+              JSON.parse(fs.readFileSync('safety_report.json', 'utf8')) : null;
+            const criticalVulns = safetyReport ? 
+              safetyReport.vulnerabilities.filter(v => v.severity === 'CRITICAL').length : 0;
+            
+            // GitHub通知
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功 ✅' : '失败 ❌'}\n` +
+                    `关键安全问题: ${criticalVulns}\n` +
+                    `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+            });
+            
+            // Slack通知
+            await slack.chat.postMessage({
+              channel: '#deployments',
+              text: `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功' : '失败'}`,
+              attachments: [
+                {
+                  color: process.env.GITHUB_JOB_STATUS === 'success' ? '#36a64f' : '#ff0000',
+                  title: `部署 ${process.env.GITHUB_JOB_STATUS === 'success' ? '成功' : '失败'}`,
+                  title_link: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+                  fields: [
+                    {
+                      title: '仓库',
+                      value: process.env.GITHUB_REPOSITORY,
+                      short: true
+                    },
+                    {
+                      title: '分支',
+                      value: process.env.GITHUB_REF_NAME,
+                      short: true
+                    },
+                    {
+                      title: '安全问题',
+                      value: criticalVulns > 0 ? `${criticalVulns} 个关键问题` : '无',
+                      short: true
+                    }
+                  ],
+                  footer: '部署通知',
+                  ts: Math.floor(Date.now() / 1000)
+                }
+              ]
+            });
+          } catch (e) {
+            console.error('通知发送失败:', e);
+          }

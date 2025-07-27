@@ -1,63 +1,261 @@
-name: Quarterly Key Rotation
+name: Secure Key Rotation with MFA
 on:
   schedule:
     - cron: "0 0 1 */3 *"  # 每季度首日午夜运行
   workflow_dispatch:        # 允许手动触发
+    inputs:
+      force:
+        description: '强制轮换(跳过验证)'
+        required: false
+        default: 'false'
 
 jobs:
   rotate-keys:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+      VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+      FORCE_ROTATION: ${{ github.event.inputs.force }}
+    
     steps:
       - uses: actions/checkout@v4
       
-      - name: Set up Python
+      - name: Set up Python with logging
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
           
-      - name: Install Vault CLI
+      - name: Install security tools
         run: |
+          echo "::group::安装安全工具"
           sudo apt-get update
-          sudo apt-get install -y vault
-          
-      - name: Rotate API Keys
-        env:
-          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
-          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          sudo apt-get install -y vault jq curl gnupg
+          pip install cryptography==45.0.5
+          echo "::endgroup::"
+
+      - name: Rotate keys with MFA verification
         run: |
-          # 1. 检查密钥是否过期
-          KEY_AGE=$(vault kv get -field=age secret/api_keys/current)
-          if [ $KEY_AGE -lt 90 ]; then
-            echo "密钥未达到90天最小使用期限，跳过轮换"
+          echo "::group::安全密钥轮换流程"
+          set -e
+          
+          # 初始化日志和临时目录
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          LOG_FILE="key_rotation_$TIMESTAMP.log"
+          TEMP_DIR="key_rotation_$TIMESTAMP"
+          mkdir -p $TEMP_DIR
+          
+          echo "Key Rotation Log - $(date)" > $LOG_FILE
+          echo "工作目录: $(pwd)" >> $LOG_FILE
+          
+          # 1. 检查密钥年龄
+          echo "[$(date)] 检查密钥年龄..." | tee -a $LOG_FILE
+          KEY_AGE=$(vault kv get -field=age secret/api_keys/current || echo "0")
+          if [ $KEY_AGE -lt 90 ] && [ "$FORCE_ROTATION" = "false" ]; then
+            echo "密钥未达到90天最小使用期限，跳过轮换" | tee -a $LOG_FILE
             exit 0
           fi
           
-          # 2. 审计密钥使用情况
-          vault read -format=json sys/audit | jq -r '.data.paths' > audit_logs.json
-          python tools/analyze_key_usage.py audit_logs.json
+          # 2. 多因素认证验证
+          echo "[$(date)] 开始MFA验证..." | tee -a $LOG_FILE
+          if [ "$FORCE_ROTATION" = "false" ]; then
+            if ! python tools/verify_mfa.py; then
+              echo "::error::MFA验证失败" | tee -a $LOG_FILE
+              exit 1
+            fi
+            echo "MFA验证通过" | tee -a $LOG_FILE
+          else
+            echo "⚠️ 跳过MFA验证 (强制模式)" | tee -a $LOG_FILE
+          fi
           
-          # 3. 生成新密钥
-          NEW_KEY=$(vault kv get -field=value secret/api_keys/new)
+          # 3. 备份当前密钥
+          echo "[$(date)] 备份当前密钥..." | tee -a $LOG_FILE
+          CURRENT_KEY=$(vault kv get -field=value secret/api_keys/current)
+          echo $CURRENT_KEY > $TEMP_DIR/current_key.bak
+          gpg --encrypt --recipient security-team@example.com $TEMP_DIR/current_key.bak
           
-          # 4. 更新系统配置
-          vault kv put secret/api_keys/current value=$NEW_KEY age=0
+          # 4. 生成新密钥并验证
+          echo "[$(date)] 生成新密钥..." | tee -a $LOG_FILE
+          NEW_KEY=$(openssl rand -hex 32)
+          echo $NEW_KEY > $TEMP_DIR/new_key.tmp
+          gpg --encrypt --recipient security-team@example.com $TEMP_DIR/new_key.tmp
           
-          # 5. 归档旧密钥并标记为已撤销
-          vault kv put secret/api_keys/old value=$(vault kv get -field=value secret/api_keys/current) status=revoked
+          # 5. 测试新密钥
+          echo "[$(date)] 测试新密钥..." | tee -a $LOG_FILE
+          if [ "$FORCE_ROTATION" = "false" ]; then
+            if ! python tools/test_reddit_api.py --key=$NEW_KEY; then
+              echo "::error::新密钥验证失败" | tee -a $LOG_FILE
+              exit 1
+            fi
+            echo "新密钥验证通过" | tee -a $LOG_FILE
+          else
+            echo "⚠️ 跳过密钥验证 (强制模式)" | tee -a $LOG_FILE
+          fi
           
-          # 6. 验证服务连接
-          python tools/test_reddit_api.py --key=$NEW_KEY || exit 1
+          # 6. 更新系统配置 (预检)
+          echo "[$(date)] 更新系统配置(预检)..." | tee -a $LOG_FILE
+          if ! python tools/update_services.py --key=$NEW_KEY --dry-run; then
+            echo "::error::服务配置预检失败" | tee -a $LOG_FILE
+            exit 1
+          fi
           
-          # 7. 更新所有服务配置
-          python tools/update_services.py --key=$NEW_KEY
+          # 7. 执行正式轮换
+          echo "[$(date)] 执行正式轮换..." | tee -a $LOG_FILE
+          vault kv put secret/api_keys/current value=$NEW_KEY age=0 || {
+            echo "::error::密钥更新失败" | tee -a $LOG_FILE
+            exit 1
+          }
           
-      - name: Notify team
+          # 8. 归档旧密钥
+          echo "[$(date)] 归档旧密钥..." | tee -a $LOG_FILE
+          vault kv put secret/api_keys/old value=$CURRENT_KEY status=revoked || {
+            echo "::warning::旧密钥归档失败，但新密钥已生效" | tee -a $LOG_FILE
+          }
+          
+          # 9. 完成部署
+          echo "[$(date)] 完成部署..." | tee -a $LOG_FILE
+          if ! python tools/update_services.py --key=$NEW_KEY; then
+            echo "::error::服务配置更新失败，执行回滚" | tee -a $LOG_FILE
+            
+            # 回滚流程
+            echo "[$(date)] 开始回滚..." | tee -a $LOG_FILE
+            vault kv put secret/api_keys/current value=$CURRENT_KEY age=$KEY_AGE || {
+              echo "::error::回滚失败，需要手动干预" | tee -a $LOG_FILE
+              exit 1
+            }
+            
+            # 恢复服务配置
+            python tools/update_services.py --key=$CURRENT_KEY || {
+              echo "::error::服务配置恢复失败" | tee -a $LOG_FILE
+              exit 1
+            }
+            
+            exit 1
+          fi
+          
+          # 10. 清理临时文件
+          echo "[$(date)] 清理临时文件..." | tee -a $LOG_FILE
+          shred -u $TEMP_DIR/*.tmp $TEMP_DIR/*.bak
+          
+          echo "[$(date)] 密钥轮换成功完成" | tee -a $LOG_FILE
+          echo "::endgroup::"
+
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: key-rotation-${{ github.run_id }}
+          path: |
+            key_rotation_*.log
+            key_rotation_*/*.gpg
+            
+      - name: Notify rotation status with details
+        if: always()
         uses: actions/github-script@v6
         with:
           script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '🔑 季度密钥轮换已完成，新密钥已部署到生产环境'
-            })
+            const fs = require('fs');
+            const { WebClient } = require('@slack/web-api');
+            const slack = new WebClient(process.env.SLACK_WEBHOOK);
+            
+            try {
+              // 读取日志文件
+              const logFiles = fs.readdirSync('.').filter(f => f.startsWith('key_rotation_'));
+              const latestLog = logFiles.length > 0 ? 
+                fs.readFileSync(logFiles[logFiles.length - 1], 'utf8') : '无日志文件';
+              
+              // 提取关键事件
+              const events = {
+                mfa: latestLog.includes('MFA验证通过') ? '✅' : (latestLog.includes('跳过MFA验证') ? '⚠️' : '❌'),
+                keyGen: latestLog.includes('生成新密钥') ? '✅' : '❌',
+                keyTest: latestLog.includes('新密钥验证通过') ? '✅' : (latestLog.includes('跳过密钥验证') ? '⚠️' : '❌'),
+                rotation: latestLog.includes('执行正式轮换') ? '✅' : '❌',
+                rollback: latestLog.includes('开始回滚') ? '🔄' : '➖'
+              };
+              
+              // GitHub通知
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `密钥轮换${process.env.GITHUB_JOB_STATUS === 'success' ? '成功 ✅' : '失败 ❌'}\n` +
+                      `强制模式: ${process.env.FORCE_ROTATION === 'true' ? '是 ⚠️' : '否'}\n` +
+                      `关键步骤:\n` +
+                      `- MFA验证: ${events.mfa}\n` +
+                      `- 密钥生成: ${events.keyGen}\n` +
+                      `- 密钥测试: ${events.keyTest}\n` +
+                      `- 正式轮换: ${events.rotation}\n` +
+                      `- 回滚操作: ${events.rollback}\n\n` +
+                      `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+              });
+              
+              // Slack通知
+              await slack.chat.postMessage({
+                channel: '#security',
+                text: `密钥轮换${process.env.GITHUB_JOB_STATUS === 'success' ? '成功' : '失败'}`,
+                blocks: [
+                  {
+                    type: 'header',
+                    text: {
+                      type: 'plain_text',
+                      text: `密钥轮换 ${process.env.GITHUB_JOB_STATUS === 'success' ? '成功' : '失败'}`,
+                      emoji: true
+                    }
+                  },
+                  {
+                    type: 'section',
+                    fields: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*模式*: ${process.env.FORCE_ROTATION === 'true' ? '强制 ⚠️' : '标准'}`
+                      },
+                      {
+                        type: 'mrkdwn',
+                        text: `*MFA验证*: ${events.mfa}`
+                      }
+                    ]
+                  },
+                  {
+                    type: 'section',
+                    fields: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*密钥生成*: ${events.keyGen}`
+                      },
+                      {
+                        type: 'mrkdwn',
+                        text: `*密钥测试*: ${events.keyTest}`
+                      }
+                    ]
+                  },
+                  {
+                    type: 'section',
+                    fields: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*正式轮换*: ${events.rotation}`
+                      },
+                      {
+                        type: 'mrkdwn',
+                        text: `*回滚操作*: ${events.rollback}`
+                      }
+                    ]
+                  },
+                  {
+                    type: 'actions',
+                    elements: [
+                      {
+                        type: 'button',
+                        text: {
+                          type: 'plain_text',
+                          text: '查看详情'
+                        },
+                        url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+                      }
+                    ]
+                  }
+                ]
+              });
+            } catch (e) {
+              console.error('通知发送失败:', e);
+            }

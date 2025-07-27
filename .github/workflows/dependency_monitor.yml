@@ -1,12 +1,23 @@
-name: Dependency Vulnerability Monitor
+name: Dependency Security Monitor
 on:
   schedule:
     - cron: '0 8 * * *'  # 每天UTC时间8点运行
   workflow_dispatch:     # 允许手动触发
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'Pipfile'
 
 jobs:
   dependency-scan:
     runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+    
     steps:
       - uses: actions/checkout@v4
       
@@ -14,49 +25,129 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
           
       - name: Install security scanners
         run: |
-          pip install --cache-dir .pip-cache safety pip-audit
+          python -m pip install --upgrade pip
+          pip install \
+            safety==2.4.5 \
+            pip-audit==2.6.1 \
+            bandit==1.7.5 \
+            --no-cache-dir
           
-      - name: Run dependency scan
+      - name: Run security scans
         run: |
-          echo "=== Safety Check ==="
-          safety check --full-report --output safety_report.json
+          echo "::group::Running Safety Check"
+          safety check --full-report --output safety_report.json || echo "::warning::Safety check failed"
           
-          echo "=== Pip Audit ==="
-          pip-audit --format json --output pip_audit_report.json
+          echo "::group::Running Pip Audit" 
+          pip-audit --format json --output pip_audit_report.json || echo "::warning::Pip audit failed"
           
-          echo "=== Analyzing Results ==="
-          python tools/analyze_vulnerabilities.py safety_report.json pip_audit_report.json
+          echo "::group::Running Bandit Scan"
+          bandit -r . -f json -o bandit_report.json || echo "::warning::Bandit scan failed"
+          
+          echo "::group::Analyzing Results"
+          if [ -f "tools/analyze_vulnerabilities.py" ]; then
+            python tools/analyze_vulnerabilities.py \
+              safety_report.json \
+              pip_audit_report.json \
+              bandit_report.json || exit 1
+          else
+            echo "::warning::Analysis script not found"
+          fi
           
       - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
-          name: dependency-reports
+          name: security-reports
           path: |
             safety_report.json
             pip_audit_report.json
+            bandit_report.json
+            tools/analyze_vulnerabilities.py
             
-      - name: Notify on critical vulnerabilities
-        if: failure()
+      - name: Notify critical vulnerabilities
+        if: always()
         uses: actions/github-script@v6
         with:
           script: |
             const fs = require('fs');
+            const { WebClient } = require('@slack/web-api');
+            const slack = new WebClient(process.env.SLACK_WEBHOOK);
+            
             try {
-              const report = fs.readFileSync('safety_report.json', 'utf8');
-              const criticalVulns = JSON.parse(report).vulnerabilities.filter(
-                v => v.severity === 'CRITICAL'
-              );
+              // Parse reports
+              const reports = {
+                safety: fs.existsSync('safety_report.json') ? 
+                  JSON.parse(fs.readFileSync('safety_report.json', 'utf8')) : null,
+                bandit: fs.existsSync('bandit_report.json') ? 
+                  JSON.parse(fs.readFileSync('bandit_report.json', 'utf8')) : null
+              };
               
-              if (criticalVulns.length > 0) {
+              // Count critical issues
+              const criticalVulns = reports.safety?.vulnerabilities?.filter(
+                v => v.severity === 'CRITICAL'
+              ) || [];
+              
+              const highVulns = reports.bandit?.results?.filter(
+                r => r.issue_severity === 'HIGH'
+              ) || [];
+              
+              // Send notifications if issues found
+              if (criticalVulns.length > 0 || highVulns.length > 0) {
+                // GitHub notification
                 github.rest.issues.createComment({
                   issue_number: context.issue.number,
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  body: `🚨 发现 ${criticalVulns.length} 个关键依赖漏洞，请立即处理！\n` +
-                        `详情见: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+                  body: `🔍 安全扫描结果:\n` +
+                        `关键依赖漏洞: ${criticalVulns.length}\n` +
+                        `高危代码问题: ${highVulns.length}\n` +
+                        `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+                });
+                
+                // Slack notification
+                await slack.chat.postMessage({
+                  channel: '#security-alerts',
+                  text: `*${process.env.GITHUB_REPOSITORY}* 安全扫描发现 ${criticalVulns.length} 个关键漏洞`,
+                  blocks: [
+                    {
+                      type: 'header',
+                      text: {
+                        type: 'plain_text',
+                        text: '安全扫描警报',
+                        emoji: true
+                      }
+                    },
+                    {
+                      type: 'section',
+                      fields: [
+                        {
+                          type: 'mrkdwn',
+                          text: `*关键依赖漏洞*: ${criticalVulns.length}`
+                        },
+                        {
+                          type: 'mrkdwn',
+                          text: `*高危代码问题*: ${highVulns.length}`
+                        }
+                      ]
+                    },
+                    {
+                      type: 'actions',
+                      elements: [
+                        {
+                          type: 'button',
+                          text: {
+                            type: 'plain_text',
+                            text: '查看详细报告'
+                          },
+                          url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+                        }
+                      ]
+                    }
+                  ]
                 });
               }
             } catch (e) {

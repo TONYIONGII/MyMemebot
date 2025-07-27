@@ -1,38 +1,314 @@
-name: Secure Deployment
-
-on: [push]
+name: Secure Deployment Pipeline
+on:
+  push:
+    branches:
+      - main
+      - release/*
+    paths:
+      - 'meme_tracker/**'
+      - 'requirements.txt'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制部署(忽略安全检查)'
+        required: false
+        default: 'false'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_DEPLOY_WEBHOOK }}
+      FORCE_DEPLOY: ${{ github.event.inputs.force }}
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout with depth 1
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
 
-    - name: Validate Environment
-      run: |
-        echo "验证部署环境..."
-        [ -f "requirements.txt" ] || { echo "::error::缺少requirements.txt"; exit 1; }
-        [ -n "$ENCRYPTION_KEY" ] || { echo "::error::未配置ENCRYPTION_KEY"; exit 1; }
-
-    - name: Set up Python
+    - name: Setup Python with caching
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
         cache: 'pip'
+        cache-dependency-path: 'requirements.txt'
 
-    - name: Install dependencies
+    - name: Install dependencies with verification
       run: |
+        echo "::group::依赖安装与验证"
         pip install --upgrade pip
         pip install -r requirements.txt --no-cache-dir
-
-    - name: Run Security Checks
-      run: |
-        bandit -r . -c pyproject.toml
         
-    - name: Build and Deploy
+        # 验证依赖签名
+        if [ -f "tools/verify_licenses.py" ]; then
+          python -m pip install pip-licenses
+          pip-licenses --format=json --output-file=licenses.json
+          python tools/verify_licenses.py licenses.json || {
+            echo "::error::依赖许可证验证失败"
+            [ "$FORCE_DEPLOY" = "true" ] || exit 1
+          }
+        else
+          echo "::warning::依赖验证脚本不存在"
+        fi
+        echo "::endgroup::"
+
+    - name: Create deployment backup
       run: |
-        echo "执行安全部署流程..."
-        # 添加您的部署脚本
+        echo "::group::创建部署备份"
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        BACKUP_DIR="deploy_backup_$TIMESTAMP"
+        mkdir -p $BACKUP_DIR
+        cp -r meme_tracker $BACKUP_DIR/
+        cp requirements.txt $BACKUP_DIR/
+        tar -czvf $BACKUP_DIR.tar.gz $BACKUP_DIR
+        echo "BACKUP_FILE=$BACKUP_DIR.tar.gz" >> $GITHUB_ENV
+        echo "::endgroup::"
+
+    - name: Environment setup
+      run: |
+        echo "::group::环境配置"
+        # 验证关键文件存在
+        required_files=("requirements.txt" "meme_tracker/config/.env.enc" "deploy.sh" "rollback.sh")
+        for file in "${required_files[@]}"; do
+          if [ ! -f "$file" ] && [ ! -d "$file" ]; then
+            echo "::error::关键文件/目录缺失: $file"
+            [ "$FORCE_DEPLOY" = "true" ] || exit 1
+          fi
+        done
+
+        # 解密环境变量
+        python -c "
+        import os
+        import sys
+        from cryptography.fernet import Fernet, InvalidToken
+        
+        try:
+            cipher = Fernet(os.environ['ENCRYPTION_KEY'].encode())
+            with open('meme_tracker/config/.env.enc', 'rb') as f:
+                encrypted = f.read()
+                try:
+                    decrypted = cipher.decrypt(encrypted).decode()
+                    os.makedirs('meme_tracker/config', exist_ok=True)
+                    with open('meme_tracker/config/.env', 'w') as out:
+                        out.write(decrypted)
+                    print('✅ 环境文件解密成功')
+                    
+                    # 验证环境变量
+                    from dotenv import load_dotenv
+                    load_dotenv('meme_tracker/config/.env')
+                    required_vars = [
+                        'REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET',
+                        'REDDIT_USER_AGENT', 'DATABASE_URL'
+                    ]
+                    missing = [var for var in required_vars if not os.getenv(var)]
+                    if missing:
+                        print(f'::error::缺少环境变量: {missing}')
+                        [ "$FORCE_DEPLOY" = "true" ] || sys.exit(1)
+                    print('✅ 环境变量验证通过')
+                    
+                except InvalidToken:
+                    print('::error::解密失败: 无效密钥或损坏文件')
+                    [ "$FORCE_DEPLOY" = "true" ] || sys.exit(1)
+        except Exception as e:
+            print(f'::error::环境设置错误: {str(e)}')
+            [ "$FORCE_DEPLOY" = "true" ] || sys.exit(1)
+        "
+        echo "::endgroup::"
+
+    - name: Security scans
+      run: |
+        echo "::group::安全扫描"
+        # 安装安全工具
+        pip install safety==2.4.5 bandit==1.7.5
+        
+        # 依赖漏洞扫描
+        safety check --full-report --output safety_report.json || {
+          echo "::warning::Safety检查失败"
+          [ "$FORCE_DEPLOY" = "true" ] || exit 1
+        }
+        
+        # 代码安全扫描
+        bandit -r meme_tracker -f json -o bandit_report.json || {
+          echo "::warning::Bandit扫描失败"
+          [ "$FORCE_DEPLOY" = "true" ] || exit 1
+        }
+        
+        # 分析扫描结果
+        if [ -f "tools/analyze_security.py" ]; then
+          python tools/analyze_security.py \
+            safety_report.json \
+            bandit_report.json || {
+              echo "::error::发现关键安全问题"
+              [ "$FORCE_DEPLOY" = "true" ] || exit 1
+            }
+        else
+          echo "::warning::安全分析脚本不存在"
+        fi
+        echo "::endgroup::"
+
+    - name: Container security scan
+      if: github.event_name == 'push'
+      run: |
+        echo "::group::容器安全扫描"
+        # 安装Trivy
+        sudo apt-get update && sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update && sudo apt-get install -y trivy || {
+          echo "::error::Trivy安装失败"
+          [ "$FORCE_DEPLOY" = "true" ] || exit 1
+        }
+        
+        # 扫描镜像
+        trivy image \
+          --security-checks vuln,config,secret \
+          --severity CRITICAL,HIGH \
+          --exit-code 1 \
+          --format template \
+          --template "@contrib/html.tpl" \
+          -o trivy_report.html \
+          your-registry/meme_tracker:${{ github.sha }} || {
+            echo "::error::容器扫描发现关键漏洞"
+            [ "$FORCE_DEPLOY" = "true" ] || exit 1
+          }
+        
+        # 验证镜像签名
+        docker trust inspect --pretty your-registry/meme_tracker:${{ github.sha }} || {
+          echo "::error::镜像签名验证失败"
+          [ "$FORCE_DEPLOY" = "true" ] || exit 1
+        }
+        echo "::endgroup::"
+
+    - name: Deploy with rollback
+      run: |
+        echo "::group::部署执行"
+        set -e
+        if ./deploy.sh; then
+          echo "✅ 部署成功"
+        else
+          echo "::error::部署失败，执行回滚"
+          
+          # 恢复备份
+          if [ -f "$BACKUP_FILE" ]; then
+            tar -xzvf $BACKUP_FILE -C .
+            ./rollback.sh || {
+              echo "::error::回滚失败，需要手动干预"
+              exit 1
+            }
+          else
+            echo "::error::备份文件不存在，无法回滚"
+            exit 1
+          fi
+        fi
+        echo "::endgroup::"
+
+    - name: Post-deployment verification
+      run: |
+        echo "::group::部署后验证"
+        # 健康检查
+        curl --retry 5 --retry-delay 10 --max-time 30 -sSf http://localhost:8000/healthcheck || {
+          echo "::error::服务健康检查失败"
+          exit 1
+        }
+        
+        # API可用性检查
+        python tools/test_api_connectivity.py || {
+          echo "::error::API连接测试失败"
+          exit 1
+        }
+        
+        # 验证环境变量
+        python -c "
+        import os
+        from dotenv import load_dotenv
+        load_dotenv('meme_tracker/config/.env')
+        required = ['REDDIT_CLIENT_ID', 'REDDIT_CLIENT_SECRET', 'DATABASE_URL']
+        missing = [var for var in required if not os.getenv(var)]
+        if missing:
+            print(f'::error::部署后环境变量缺失: {missing}')
+            exit(1)
+        "
+        echo "::endgroup::"
+
+    - name: Upload artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-artifacts
+        path: |
+          $BACKUP_FILE
+          safety_report.json
+          bandit_report.json
+          trivy_report.html
+
+    - name: Notify deployment status
+      if: always()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const { WebClient } = require('@slack/web-api');
+          const slack = new WebClient(process.env.SLACK_WEBHOOK);
+          
+          try {
+            // 读取安全报告
+            const safetyReport = fs.existsSync('safety_report.json') ? 
+              JSON.parse(fs.readFileSync('safety_report.json', 'utf8')) : null;
+            const criticalVulns = safetyReport ? 
+              safetyReport.vulnerabilities.filter(v => v.severity === 'CRITICAL').length : 0;
+            
+            // GitHub通知
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功 ✅' : '失败 ❌'}\n` +
+                    `强制部署: ${process.env.FORCE_DEPLOY === 'true' ? '是 ⚠️' : '否'}\n` +
+                    `关键安全问题: ${criticalVulns}\n` +
+                    `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+            });
+            
+            // Slack通知
+            await slack.chat.postMessage({
+              channel: '#deployments',
+              text: `部署${process.env.GITHUB_JOB_STATUS === 'success' ? '成功' : '失败'}`,
+              attachments: [
+                {
+                  color: process.env.GITHUB_JOB_STATUS === 'success' ? 
+                    (process.env.FORCE_DEPLOY === 'true' ? '#FFA500' : '#36a64f') : '#ff0000',
+                  title: `部署 ${process.env.GITHUB_JOB_STATUS === 'success' ? '成功' : '失败'}`,
+                  title_link: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+                  fields: [
+                    {
+                      title: '仓库',
+                      value: process.env.GITHUB_REPOSITORY,
+                      short: true
+                    },
+                    {
+                      title: '分支',
+                      value: process.env.GITHUB_REF_NAME,
+                      short: true
+                    },
+                    {
+                      title: '强制部署',
+                      value: process.env.FORCE_DEPLOY === 'true' ? '是 ⚠️' : '否',
+                      short: true
+                    },
+                    {
+                      title: '安全问题',
+                      value: criticalVulns > 0 ? `${criticalVulns} 个关键问题` : '无',
+                      short: true
+                    }
+                  ],
+                  footer: '部署通知',
+                  ts: Math.floor(Date.now() / 1000)
+                }
+              ]
+            });
+          } catch (e) {
+            console.error('通知发送失败:', e);
+          }

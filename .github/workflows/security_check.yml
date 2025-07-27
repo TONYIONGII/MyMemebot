@@ -1,35 +1,257 @@
-name: Security Audit
+name: Comprehensive Security Audit
 on:
   schedule:
-    - cron: '0 0 1 * *' # 每月1日执行
+    - cron: '0 0 1 * *'  # 每月1日执行
+  workflow_dispatch:
+    inputs:
+      full_scan:
+        description: '执行完整扫描(包括修复建议)'
+        required: false
+        default: 'false'
+      severity:
+        description: '最低报告严重性等级'
+        required: false
+        default: 'medium'
+        type: choice
+        options:
+          - critical
+          - high
+          - medium
+          - low
+
 jobs:
-  audit:
+  security-audit:
     runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+      MIN_SEVERITY: ${{ github.event.inputs.severity || 'medium' }}
+      FULL_SCAN: ${{ github.event.inputs.full_scan || 'false' }}
     permissions:
       contents: write
+      security-events: write
+      actions: write
+      
     steps:
       - uses: actions/checkout@v4
+      
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-      - name: Run security check
+          
+      - name: Install audit tools
         run: |
-          cd meme_tracker
-          ./security_check.sh || exit 1
+          echo "::group::安装安全工具"
+          pip install --upgrade pip
+          pip install \
+            safety==2.4.5 \
+            bandit==1.7.5 \
+            pip-audit==2.6.1 \
+            semgrep==1.62.0 \
+            git+https://github.com/pyupio/safety-db.git \
+            vulners==1.4.0
+          echo "::endgroup::"
+
+      - name: Run security audit
+        run: |
+          echo "::group::执行安全审计"
+          set -e
+          
+          # 准备报告目录
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          REPORT_DIR="security_audit_$TIMESTAMP"
+          mkdir -p $REPORT_DIR
+          
+          # 运行安全扫描
+          echo "=== 依赖安全检查 ===" > $REPORT_DIR/full_report.md
+          safety check --full-report --json > $REPORT_DIR/safety_report.json
+          python -c "
+          import json
+          with open('$REPORT_DIR/safety_report.json') as f:
+              data = json.load(f)
+              vulns = [v for v in data.get('vulnerabilities', []) 
+                      if v['severity'].lower() >= '$MIN_SEVERITY'.lower()]
+              print(f'发现 {len(vulns)} 个依赖安全问题')
+              for v in vulns:
+                  print(f'- {v["package_name"]}@{v["analyzed_version"]}: {v["advisory"]}')
+          " >> $REPORT_DIR/full_report.md
+          
+          echo "\n=== 代码安全检查 ===" >> $REPORT_DIR/full_report.md
+          bandit -r . -f json -o $REPORT_DIR/bandit_report.json
+          python -c "
+          import json
+          with open('$REPORT_DIR/bandit_report.json') as f:
+              data = json.load(f)
+              issues = [i for i in data.get('results', []) 
+                       if i['issue_severity'].lower() >= '$MIN_SEVERITY'.lower()]
+              print(f'发现 {len(issues)} 个代码安全问题')
+              for i in issues:
+                  print(f'- {i["test_name"]} in {i["filename"]}:{i["line_number"]}')
+          " >> $REPORT_DIR/full_report.md
+          
+          echo "\n=== 依赖漏洞审计 ===" >> $REPORT_DIR/full_report.md
+          pip-audit --format json --output $REPORT_DIR/pip_audit_report.json
+          python -c "
+          import json
+          with open('$REPORT_DIR/pip_audit_report.json') as f:
+              data = json.load(f)
+              vulns = [v for v in data.get('vulnerabilities', []) 
+                      if v['severity'].lower() >= '$MIN_SEVERITY'.lower()]
+              print(f'发现 {len(vulns)} 个依赖漏洞')
+              for v in vulns:
+                  print(f'- {v["name"]}@{v["specs"][0]["version"]}: {v["advisory"]}')
+          " >> $REPORT_DIR/full_report.md
+          
+          echo "\n=== 语义模式检查 ===" >> $REPORT_DIR/full_report.md
+          semgrep --config auto --json -o $REPORT_DIR/semgrep_report.json
+          python -c "
+          import json
+          with open('$REPORT_DIR/semgrep_report.json') as f:
+              data = json.load(f)
+              results = [r for r in data.get('results', []) 
+                        if r['extra']['severity'].lower() >= '$MIN_SEVERITY'.lower()]
+              print(f'发现 {len(results)} 个语义模式问题')
+              for r in results:
+                  print(f'- {r["check_id"]} in {r["path"]}:{r["start"]["line"]}')
+          " >> $REPORT_DIR/full_report.md
+          
+          # 生成修复建议
+          if [ "$FULL_SCAN" = "true" ]; then
+            echo "\n=== 修复建议 ===" >> $REPORT_DIR/full_report.md
+            python tools/generate_fixes.py \
+              --safety $REPORT_DIR/safety_report.json \
+              --bandit $REPORT_DIR/bandit_report.json \
+              --pip-audit $REPORT_DIR/pip_audit_report.json \
+              --semgrep $REPORT_DIR/semgrep_report.json \
+              --output $REPORT_DIR/fixes.md
+            cat $REPORT_DIR/fixes.md >> $REPORT_DIR/full_report.md
+          fi
+          
+          # 提交审计报告
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git add config/SECURITY.log
-          git commit -m "月度安全审计 $(date +%Y-%m-%d)"
+          git add $REPORT_DIR/
+          git commit -m "安全审计报告 $TIMESTAMP (严重性: $MIN_SEVERITY)"
           git push
-      - name: Notify on failure
-        if: failure()
+          echo "::endgroup::"
+          
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-${{ github.run_id }}
+          path: |
+            security_audit_*/
+          
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security_audit_*/semgrep_report.json
+          
+      - name: Notify detailed results
+        if: always()
         uses: actions/github-script@v6
         with:
           script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '⚠️ 安全审计失败，请检查日志！'
-            })
+            const fs = require('fs');
+            const { WebClient } = require('@slack/web-api');
+            const slack = new WebClient(process.env.SLACK_WEBHOOK);
+            
+            try {
+              // 读取最新报告
+              const reportDirs = fs.readdirSync('.').filter(f => f.startsWith('security_audit_'));
+              const latestReport = reportDirs.length > 0 ? 
+                fs.readFileSync(`${reportDirs[reportDirs.length - 1]}/full_report.md`, 'utf8') : '无审计报告';
+              
+              // 统计问题数量
+              const stats = {
+                safety: (latestReport.match(/发现 (\d+) 个依赖安全问题/) || [])[1] || '0',
+                bandit: (latestReport.match(/发现 (\d+) 个代码安全问题/) || [])[1] || '0',
+                pipAudit: (latestReport.match(/发现 (\d+) 个依赖漏洞/) || [])[1] || '0',
+                semgrep: (latestReport.match(/发现 (\d+) 个语义模式问题/) || [])[1] || '0'
+              };
+              
+              // GitHub通知
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `安全审计${process.env.GITHUB_JOB_STATUS === 'success' ? '完成 ✅' : '失败 ❌'}\n` +
+                      `最低严重性: ${process.env.MIN_SEVERITY}\n` +
+                      `扫描结果:\n` +
+                      `- 依赖安全: ${stats.safety} 问题\n` +
+                      `- 代码安全: ${stats.bandit} 问题\n` +
+                      `- 依赖漏洞: ${stats.pipAudit} 问题\n` +
+                      `- 语义模式: ${stats.semgrep} 问题\n\n` +
+                      `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+              });
+              
+              // Slack通知
+              await slack.chat.postMessage({
+                channel: '#security',
+                text: `安全审计${process.env.GITHUB_JOB_STATUS === 'success' ? '完成' : '失败'}`,
+                blocks: [
+                  {
+                    type: 'header',
+                    text: {
+                      type: 'plain_text',
+                      text: `安全审计 ${process.env.GITHUB_JOB_STATUS === 'success' ? '完成' : '失败'}`,
+                      emoji: true
+                    }
+                  },
+                  {
+                    type: 'section',
+                    fields: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*最低严重性*: ${process.env.MIN_SEVERITY}`
+                      },
+                      {
+                        type: 'mrkdwn',
+                        text: `*完整扫描*: ${process.env.FULL_SCAN === 'true' ? '是' : '否'}`
+                      }
+                    ]
+                  },
+                  {
+                    type: 'section',
+                    fields: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*依赖安全*: ${stats.safety} 问题`
+                      },
+                      {
+                        type: 'mrkdwn',
+                        text: `*代码安全*: ${stats.bandit} 问题`
+                      }
+                    ]
+                  },
+                  {
+                    type: 'section',
+                    fields: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*依赖漏洞*: ${stats.pipAudit} 问题`
+                      },
+                      {
+                        type: 'mrkdwn',
+                        text: `*语义模式*: ${stats.semgrep} 问题`
+                      }
+                    ]
+                  },
+                  {
+                    type: 'actions',
+                    elements: [
+                      {
+                        type: 'button',
+                        text: {
+                          type: 'plain_text',
+                          text: '查看详情'
+                        },
+                        url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+                      }
+                    ]
+                  }
+                ]
+              });
+            } catch (e) {
+              console.error('通知发送失败:', e);
+            }

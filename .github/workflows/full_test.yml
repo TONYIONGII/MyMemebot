@@ -1,58 +1,203 @@
-name: Full API Test with Notification
-on: [workflow_dispatch]
+name: Comprehensive API Testing Suite
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'meme_tracker/**'
+      - 'requirements.txt'
+      - '.github/workflows/full_test.yml'
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 18 * * 1-5'  # 工作日UTC时间18点运行
+  workflow_dispatch:
+    inputs:
+      full_coverage:
+        description: '执行完整覆盖率测试'
+        required: false
+        default: 'false'
 
 jobs:
   api-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REDDIT_API_KEY: ${{ secrets.REDDIT_API_KEY }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_TEST_WEBHOOK }}
+      MIN_COVERAGE: 80
+      FULL_COVERAGE: ${{ github.event.inputs.full_coverage }}
+    
     steps:
       - uses: actions/checkout@v4
       
-      - name: Set up Python
+      - name: Set up Python with caching
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
           
-      - name: Install dependencies
+      - name: Install test environment
         run: |
+          echo "::group::设置测试环境"
           python -m pip install --upgrade pip
-          pip install --cache-dir .pip-cache \
-            httpcore==1.0.9 \
-            httpx==0.28.1 \
-            python-telegram-bot==22.3 \
+          
+          # 安装核心测试依赖
+          pip install \
+            pytest==8.4.1 \
+            pytest-cov==4.1.0 \
+            pytest-xdist==3.5.0 \
+            pytest-mock==3.14.0 \
+            requests==2.31.0 \
+            cryptography==45.0.5 \
             -r requirements.txt
-          pip install --cache-dir .pip-cache \
-            pytest \
-            requests \
-            cryptography
-          
+            
+          # 完整覆盖率测试需要额外依赖
+          if [ "$FULL_COVERAGE" = "true" ]; then
+            pip install pytest-benchmark==4.0.0 pytest-randomly==3.15.0
+          fi
+          echo "::endgroup::"
+
       - name: Run API tests
-        timeout-minutes: 10
-        env:
-          REDDIT_API_KEY: ${{ secrets.REDDIT_API_KEY }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # 执行所有API测试
-          pytest meme_tracker/tools/test_reddit_api.py ./final_validation.py -v > test_results.txt || echo "::warning::Tests failed"
+          echo "::group::执行API测试"
+          set -e
           
-          # 发送测试结果到Telegram
-          python -c "
-          import os, requests
-          try:
-              with open('test_results.txt') as f:
-                  text = f.read()
-              resp = requests.post(
-                  f'https://api.telegram.org/bot{os.getenv(\"TELEGRAM_TOKEN\")}/sendMessage',
-                  json={'chat_id': os.getenv('TELEGRAM_CHAT_ID'), 
-                        'text': f'✅ API测试完成：\n{text[:1000]}'}
-              )
-              print(f'Telegram通知状态: {resp.status_code}')
-          except Exception as e:
-              print(f'⚠️ 通知发送失败: {str(e)}')
-          "
+          # 准备测试命令
+          TEST_CMD="pytest \
+            meme_tracker/tools/test_reddit_api.py \
+            ./final_validation.py \
+            -v \
+            --cov=meme_tracker \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov \
+            -n auto"
           
-      - name: Upload results
+          # 添加完整覆盖率测试选项
+          if [ "$FULL_COVERAGE" = "true" ]; then
+            TEST_CMD="$TEST_CMD --benchmark-skip"
+          fi
+          
+          # 执行测试
+          $TEST_CMD > test_results.txt || {
+            echo "::error::测试失败"
+            [ "$FULL_COVERAGE" = "true" ] || exit 1
+          }
+          
+          # 分析测试结果
+          if [ -f "tools/analyze_test_results.py" ]; then
+            python tools/analyze_test_results.py test_results.txt coverage.xml || {
+              echo "::error::测试结果分析失败"
+              exit 1
+            }
+          else
+            echo "::warning::测试分析脚本不存在"
+          fi
+          
+          # 检查覆盖率
+          COVERAGE=$(grep -oP 'line-rate="\K[0-9.]+' coverage.xml)
+          if (( $(echo "$COVERAGE * 100 < $MIN_COVERAGE" | bc -l) )); then
+            echo "::error::代码覆盖率不足 ${COVERAGE}% < ${MIN_COVERAGE}%"
+            [ "$FULL_COVERAGE" = "true" ] || exit 1
+          fi
+          echo "::endgroup::"
+          
+      - name: Upload test artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: api-test-results
-          path: test_results.txt
+          name: test-artifacts-${{ github.run_id }}
+          path: |
+            test_results.txt
+            coverage.xml
+            htmlcov/
+            tools/analyze_test_results.py
+            
+      - name: Analyze test failures
+        if: failure()
+        run: |
+          echo "::group::分析测试失败原因"
+          if [ -f "test_results.txt" ]; then
+            # 提取失败测试
+            FAILED_TESTS=$(grep -E 'FAILED|ERROR' test_results.txt | head -5)
+            echo "最近5个失败测试:"
+            echo "$FAILED_TESTS"
+            
+            # 提取错误日志
+            ERRORS=$(grep -A 10 -E 'FAILED|ERROR' test_results.txt | head -20)
+            echo "错误摘要:"
+            echo "$ERRORS"
+          else
+            echo "::warning::测试结果文件不存在"
+          fi
+          echo "::endgroup::"
+          
+      - name: Notify test results
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const { WebClient } = require('@slack/web-api');
+            const slack = new WebClient(process.env.SLACK_WEBHOOK);
+            
+            try {
+              // 读取测试结果
+              const testOutput = fs.existsSync('test_results.txt') ? 
+                fs.readFileSync('test_results.txt', 'utf8') : '无测试结果';
+              const coverageReport = fs.existsSync('coverage.xml') ? 
+                require('xml2js').parseStringSync(fs.readFileSync('coverage.xml', 'utf8')) : null;
+              
+              // 计算失败测试数
+              const failedTests = testOutput.match(/FAILED|ERROR/g)?.length || 0;
+              const coveragePercent = coverageReport ? 
+                Math.round(coverageReport.coverage.$.line-rate * 100) : 0;
+              
+              // GitHub通知
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `测试${process.env.GITHUB_JOB_STATUS === 'success' ? '通过 ✅' : '失败 ❌'}\n` +
+                      `失败测试: ${failedTests}\n` +
+                      `覆盖率: ${coveragePercent}% (最低要求: ${process.env.MIN_COVERAGE}%)\n` +
+                      `详情: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+              });
+              
+              // Slack通知
+              await slack.chat.postMessage({
+                channel: '#test-results',
+                text: `API测试${process.env.GITHUB_JOB_STATUS === 'success' ? '通过' : '失败'}`,
+                attachments: [
+                  {
+                    color: process.env.GITHUB_JOB_STATUS === 'success' ? 
+                      (coveragePercent < process.env.MIN_COVERAGE ? '#FFA500' : '#36a64f') : '#ff0000',
+                    title: `测试 ${process.env.GITHUB_JOB_STATUS === 'success' ? '通过' : '失败'}`,
+                    title_link: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+                    fields: [
+                      {
+                        title: '分支',
+                        value: process.env.GITHUB_REF_NAME,
+                        short: true
+                      },
+                      {
+                        title: '失败测试',
+                        value: failedTests,
+                        short: true
+                      },
+                      {
+                        title: '覆盖率',
+                        value: `${coveragePercent}% (最低: ${process.env.MIN_COVERAGE}%)`,
+                        short: true
+                      }
+                    ],
+                    footer: '测试结果通知',
+                    ts: Math.floor(Date.now() / 1000)
+                  }
+                ]
+              });
+            } catch (e) {
+              console.error('通知发送失败:', e);
+            }
